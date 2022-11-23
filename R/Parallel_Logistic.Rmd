@@ -1,0 +1,404 @@
+---
+output:
+  bookdown::pdf_document2:
+    keep_tex: no
+    pandoc_args: [--listings]
+    toc: false
+    toc_depth: 2
+    fig_caption: yes
+    highlight: haddock
+    number_sections: yes
+    includes:
+     in_header: "utils/header.tex"
+     before_body: "utils/title.sty"
+geometry: "left=1.5cm,right=1.5cm,top=2.5cm,bottom=2.5cm"
+mainfont: SourceSansPro
+monofont: "Monaco"
+fontsize: 11pt
+linestretch: 1
+setspace: singlespacing
+link-citations: yes
+linkcolor: blue
+urlcolor: cyan
+citecolor: blue
+---
+```{r setup, include=FALSE}
+setwd("~/Workbench/ENSAI/R/ParallelComputingR")
+Sys.setenv(LANG = "en")
+set.seed(1)
+library(tidyverse)
+library(kableExtra)
+options(digits = 3, scipen=999,
+        width = 75)
+knitr::opts_chunk$set(message=FALSE, warning=FALSE,
+                      comment = "R> ", 
+                      tidy='styler',
+                      fig.path='outputs/')
+```
+
+# Introduction {}
+
+The purpose of this project is to implement in `R` a procedure for selecting the variables in the logit model (without using the `glm` function). The procedure for selecting the variables is a **stepwise search** which optimizes the prediction error estimated by *cross-validation*. 
+
+The project is divided in two parts. In the first part we define the basic functions needed to perform correctly the model. In order to check the consistency of our results we will check the results with the *base R* `glm` function. In the second part instead we will try to optimize our functions, where possible using code profiling and parallel computing.
+
+# Logistic Regression
+
+Let $\left(X_{1}^{\top}, Y_{1}\right), \ldots,\left(X_{n}^{\top}, Y_{n}\right)$ be observed independent copies of the random vector
+$$
+\left(X^{\top}, Y\right) \text { with } 
+\mathbf{X}=\left[\begin{array}{ccccc}
+1 & x_{1,1} & x_{1,2} & \ldots & x_{1, p} \\
+1 & x_{2,1} & x_{2,2} & \ldots & x_{2, p} \\
+\ldots & & & & \\
+1 & x_{n, 1} & x_{n, 2} & \ldots & x_{n, p}
+\end{array}\right] \in \mathbb{R}^{n \times(p+1)} \text { and } Y \in\{0,1\} .
+$$
+
+The distribution of $Y$ given $X=x$ is assumed to be a logit model, such that
+
+$$
+\mathbb{P}(Y=1 \mid X=x)=\frac{e^{x^{\top} \beta}}{1+e^{x^{\top} \beta}} \text { and } \mathbb{P}(Y=0 \mid X=x)=1-\mathbb{P}(Y=1 \mid X=x),
+$$
+where $\beta \in \mathbb{R}^{p}$ is the vector of the model parameters.
+
+## Generate observations from a logit model
+Within the script *"GenerateData.R"*, we define a function rlogit which generate observations from a logit model and from random coefficients, the results are then stored in a list. However, for the reproducibility of the example and to control the expected behaviour of our functions in order to check the consistency of our model selection function, we have defined our parameters calling another function `rlogit_with_param`.
+
+```{r}
+miceadds::source.all(path="scripts", print.source=FALSE)
+set.seed(123)
+sample <-rlogit_with_param(1000, params = c(-1, 0, 1.5, -0.85, 0, 2.3))
+```
+```{r echo=FALSE, }
+sample %>% lobstr::tree()
+```
+
+
+## Maximum Likelihood Estimation
+
+In this section we will implement the function `basic.mle` which takes as input the covariates and the dependent
+variable. This function returns the maximum likelihood estimator (**MLE**) $\hat{\beta}$ defined by
+$$
+\hat{\beta}=\underset{\beta}{\arg \max } \sum_{i=1}^{n} \ell\left(y \mid X;  \beta\right) \text { with } \ell\left(y \mid X; \beta\right)=y_{i}\left(\beta X^{T}\right)-\ln \left(1+e^{\beta X^{T}}\right) .
+$$ 
+The problem of maximization does not admit a closed form solution. However, the MLE can be estimated by the **Newton-Raphson** algorithm. Starting from the initial point $\beta^{[0]}$, the algorithm iterates until the converge is reached. Its iteration $[i]$ is defined by:
+
+$$
+\beta^{(i+1)}=\beta^{(i)}-H^{-1}\left(\beta^{(i)}\right) \nabla f\left(\beta^{(i)}\right) 
+$$
+where $\nabla f$ is the *gradient* of the log-likelihood, the vector of its partial derivatives and $H$ is the *Hessian* of $f$, its matrix of second partial derivatives:
+
+$$
+\begin{aligned}
+\nabla f(\beta) =&\frac{\partial l(\beta)}{\partial \beta}=\sum_{i=1}^n x_i\left(y_i-p\left(x_i ; \beta\right)\right)\\
+H(\beta) = &\frac{\partial^2 l(\beta)}{\partial \beta \partial \beta^{\top}}=-\sum_{i=1}^n x_i^{\top} x_i p\left(x_i ; \beta\right)\left(1-p\left(x_i ; \beta\right)\right)
+\end{aligned}
+$$
+
+
+\begin{algorithm}[H]
+\DontPrintSemicolon
+\SetAlgoLined
+\KwResult{MLE $\hat{\beta}$}
+\SetKwInOut{Input}{Input}\SetKwInOut{Output}{Output}
+\Input{Matrix with covariates $X$, vector of the variable to predict $y$, }
+\Output{Vector of parameters $\hat{\beta}$} 
+\BlankLine
+Inititalise a vector as guess for the minimum\;
+Define threshold\;
+\While{The relative difference between $f(\beta), f(\beta)^{i} < threshold$}
+   {
+   		Update the iteration by computing gradient and the inverse of Hessian\;
+   }
+\caption{Newton-Raphson algorithm for MLE}
+\end{algorithm} 
+
+## Consistency of the N-R algorithm for MLE
+
+```{r}
+source("scripts/MLE.R")
+rbind(
+  "basic.mle" = basic.mle(sample$X,sample$Y),
+  "glm" = glm(sample$Y~sample$X+0,family = 'binomial')$coeff
+) -> table1
+```
+```{r, echo=FALSE}
+kable(table1, format = "latex") %>% 
+	kable_styling(full_width = F,
+								font_size = 10,
+								latex_options = c("HOLD_position"),
+								protect_latex = T) %>% 
+	row_spec(0, bold = T,
+	         color = "white",
+	         background = "#4193D2",
+					 font_size= 10) %>% 
+	column_spec(1, monospace = T, 
+							width = "4.5cm", 
+							latex_valign = "m",
+							border_left = T)
+```
+
+\newpage
+
+# Model Selection
+
+In this part, we will implement some functions in order to get the best model (i.e., the subset of the relevant variables of our data) and its estimator of the prediction error, obtained by **cross-validation** for any subset of covariates. 
+
+In order to implement this in `R`, we will need to define three function:
+
+```{r, echo=FALSE}
+data.frame(
+	Variables = c("basic.cv", "basic.modelcomparison", "basic.modelselection"),
+		Input = c("#Folds, Sample", "Sample, Set of Models", "Sample"),
+		Output = c("Error", "Best model, Error", "Best model"),
+	Description = c(
+		"This function returns the estimator of the error of prediction obtained by cross-validation for any subset of covariates by using the MLE of the model",
+		"This function returns the best model (i.e., the subset of the relevant variables) and its estimator of the prediction error",
+		"returns the best model (i.e., the subset of the relevant variables) and its estimator of the prediction error, using a forward approach")
+) %>% kable( 
+			format = "latex",
+			caption = "Description of the functions implemented in this section",
+			linesep =  "\\hline") %>% 
+	kable_styling(full_width = F,
+								font_size = 9,
+								latex_options = c("striped","HOLD_position"),
+								protect_latex = T) %>% 
+	row_spec(0, bold = T,
+	         color = "white",
+	         background = "#4193D2",
+					 font_size= 10) %>% 
+	column_spec(1, monospace = T, 
+							width = "4.5cm", 
+							latex_valign = "m",
+							border_left = T) %>% 
+	column_spec(2, width = "3cm", latex_valign = "m") %>%
+	column_spec(3, width = "3cm",latex_valign = "m") %>%
+	column_spec(4, width = "6cm", border_right=T, latex_valign = "m") 
+```
+
+
+## Cross Validation
+
+In order to estimate how accurately our predictive model will perform in practice, we have computed a function which performs **cross-validation** for any different subset of covariates. Cross-validation is a resampling method that uses different portions of the data to test and train a model on different iterations, in order to get an estimation of the prediction error.
+
+  \begin{minipage}{\linewidth}
+      \centering
+      \begin{minipage}{0.45\linewidth}
+          \begin{figure}[H]
+              \includegraphics[width=\linewidth]{utils/img/cv_code.png}
+              \caption{Graphic Representation of CV}
+          \end{figure}
+      \end{minipage}
+      \hspace{0.05\linewidth}
+      \begin{minipage}{0.45\linewidth}
+          \begin{figure}[H]
+              \includegraphics[width=\linewidth]{utils/img/cross_val.png}
+              \caption{Pseudocode for the cross validation}
+          \end{figure}
+      \end{minipage}
+  \end{minipage}
+
+Below we reported a simple implementation of our `basic.cv` function. In this example we have specified a 5-Fold implementation of the algorithm on our sample. As an estimate of the error of our logistic classifier, we have computed the **accuracy**:
+$$
+Accuracy = \frac{True \ Positive + True \ Negative}{Total \ Population}
+$$
+
+The results is stored in a list which contains the best model according the accuracy, the list with the parameters in each fold, their respective accuracy and the averaged accuracy.
+```{r}
+source("scripts/CV.R")
+set.seed(4564)
+basic.cv(5, sample$X, sample$Y) %>% lobstr::tree()
+```
+
+
+## Stepwise Regression: Forward Selection
+
+**Forward stepwise selection**:
+
+- First, we approximate the response variable y with a constant (i.e., an intercept-only model).
+- Then we gradually add one more variable at a time.
+- Every time we always choose from the rest of the variables the one that yields the best accuracy in prediction using cross validation, when added to the pool of already selected variables.
+
+```{r}
+# Model comparison procedure
+set.seed(464)
+basic.modelcomparison(sample$X,sample$Y, list(c(1,2,3),c(1,3,4),c(1,2,6),c(1,3,6),c(1,3,4,5),c(1,4,6)))
+```
+
+
+```{r}
+# Consistency of the model selection procedure
+set.seed(53)
+basic.modelselection(sample$X,sample$Y)
+```
+
+As expected from the data generation, our function did not select the second and fith variables which were generated from parameters set to 0 (also the 4 was close to 0).  
+
+\newpage
+
+# Optimization
+
+## Code profiling 
+We started by profiling our functions, understaning which tasks required most computational time. We used the `profvis` package. The output shows in the top pane the source code, overlaid with bar graphs for memory and execution time for each line of code, whereas the bottom pane displays a **flame graph** showing the full call stack, i.e. the sequence of calls leading to each function.
+
+\begin{figure}
+\centering
+  \includegraphics[width=15cm, height=6cm, keepaspectratio]{utils/img/prof.png}
+  \caption{Code profiling of MLE.R}
+\end{figure}
+
+After having understood which were the parts of our codes slowing the functions, we rewrote new functions (in scripts folder, with base name and *_opt*') which optimize the starting ones without the need of parallel computing. Some remarks:
+
+- MLE: we tried using nested sapply instead of nested for loops, however calling it into other functions does not improve the overall. We also tried using matrix operators but did not improve the function. Examples of computing H:
+
+    ```{r, eval = F}
+    z <- x %*% param
+    z <- exp(z) / ((1 + exp(z)) ** 2)
+    # 1 option
+    Hmatrix < sapply(1:ncol(x), function(i) sapply(1:ncol(x), function(j) sum(-z * x[, i] * x[, j])))
+    # 2 option
+    Hmatrix <- -(t(x) %*% diag(c(z)) %*% x)
+    # 3 option
+    Hmatrix <- matrix(NA, ncol(x), ncol(x))
+     for (i in 1:ncol(x)) {
+       for (j in 1:ncol(x)) {
+         Hmatrix[i, j] <- sum(-z * x[, i] * x[, j])
+     }
+    }
+    ```
+
+- CV: we used base r subsetting operators instead of functions
+- In the model selection functions we call CV_opt instead of CV
+
+## Parallel Computing
+
+When the optimization methods have not apported better result, we implemented **parallel computing** techniques to improve the code. We have used the function `mclapply` from the package `{parallel}`. 
+
+This approach was used in our `basic.cv` function, and then it was implemented also within `basic.ModelSelection_par` and we have obtained significant reduction in computational times, see the figure below as an example:
+
+\begin{minipage}{\linewidth}
+      \centering
+      \begin{minipage}{0.45\linewidth}
+          \begin{figure}[H]
+              \includegraphics[width=\linewidth]{utils/img/parallelEX.png}
+              \caption{Graphic Representation of CV}
+          \end{figure}
+      \end{minipage}
+      \hspace{0.05\linewidth}
+      \begin{minipage}{0.45\linewidth}
+          \begin{figure}[H]
+              \includegraphics[width=\linewidth]{utils/img/parallelEX2.png}
+              \caption{Pseudocode for the cross validation}
+          \end{figure}
+      \end{minipage}
+\end{minipage}
+\hspace{3cm}
+
+Here is the implementation of our function using mcapply:
+
+\hspace{2cm}
+
+```{r, eval=FALSE}
+# This is the part of our code implementing mclapply
+  list_cv<-mclapply(1:Kfold, function(i){
+  Xtrain <- as.matrix(data[data$fold != i, -c(1, ncol(data))])
+  Xval <- as.matrix(data[data$fold == i, -c(1, ncol(data))])
+  Ytrain <- as.vector(data[data$fold != i, 1])
+  Yval <- as.vector(data[data$fold == i, 1])
+    
+  params <- basic.mle(Xtrain, Ytrain)
+  predict_vector <- predict.mle(Xval, params)
+    
+  perf <- sum(((predict_vector == Yval) * 1)) / length(Yval)
+    
+  param_vec <- params
+  perf_vec <- perf
+  return(list(param_vec=param_vec,perf_vec=perf_vec))
+  }, mc.cores = 10)
+```
+
+
+\newpage
+
+# Consistency of the model 
+Illustrate the consistency of the procedure of model selection by a reproducible numerical experiment
+Besides illustrating the correctness of our `modelselection` function, as we have done in page 4, we reproduced a numerical experiment to plot the consistency of our implementation. To do this, we wrote a function in *Consistency.R*
+
+```{r, eval=FALSE}
+library(tictoc)
+tic()
+consistency(vec_obs=c(100,150,250,400,500,800,1000,1500,2500,4000,5000,8000,10000))
+toc() #162.29 sec elapsed
+```
+
+ \begin{figure}[H]
+ \centering
+ \includegraphics[width=18cm, height=6cm]{utils/img/1.png}
+ \end{figure}
+
+```{r echo=FALSE, eval=FALSE}
+load("utils/img/results1.RData") 
+r
+library(apexcharter)
+apexchart(
+        ax_opts = list(
+            chart = list(type = "line"),
+            stroke = list(curve = "smooth"),
+            grid = list(
+                borderColor = "#e7e7e7",
+                row = list(
+                    colors = c("#f3f3f3", "transparent"),
+                    opacity = 0.5
+                )
+            ),
+            markers = list(style = "inverted", size = 4),
+            series = list(
+                list(name = "True Positive Rate",
+                         data = consistency_df$True_Positive_rate),
+                list(name = "True Negative Rate",
+                         data = consistency_df$True_Negative_rate)
+            ),
+            title = list(text = "Consistency of Model Selection",
+                                     align = "center"),
+            xaxis = list(categories = consistency_df$vec_obs)
+        )
+    ) %>%
+    ax_yaxis(labels = list(formatter = format_num(".2f")),
+             tickAmount = 5, max = 1.2) %>% 
+    ax_subtitle(
+        text = "Results of our numerical experiment", 
+        align = "center") %>%
+    ax_stroke(width = 2) %>%
+    ax_colors("#4193D2", "#A0C9E9")
+```
+
+
+## Numerical Experiment over different CPUs
+As the numerical experiment from the step before involved many seconds (162.29 sec elapsed) to provide the result, we thought of improving it using parallel computing with *consistency_par*. The results is shown beow:
+
+ \begin{figure}[H]
+ \centering
+ \includegraphics[width=12cm, height=6cm]{utils/img/cons.png}
+ \end{figure}
+  
+  
+\newpage
+
+# Appendix {-}
+## Project Structure {-}
+Below we are reporting the content of our zipped submission file.
+It contains an R project file (*.Rproj*), the Rmarkdown file used to knit the report and the converted *.pdf* report, along with some folders:
+
+```{r, echo=FALSE}
+#fs::dir_tree(recurse = 0)
+```
+
+\begin{figure}[H]   
+\includegraphics[width=4cm, height=4cm]{utils/img/s.png}
+\end{figure}
+
+- The folder *scripts* cotains the scripts with the different functions defined for the different tasks.
+- The folder *profiling* contains the results of code profiling of each function
+- The folder *test* to show the functions in action
+- The folder *utils* it was needed just to compile the report, not useful for the purpose of the project.
